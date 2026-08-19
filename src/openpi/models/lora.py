@@ -1,5 +1,6 @@
 import math
 import re
+from typing import Any
 
 import flax.linen as nn
 import flax.struct as struct
@@ -39,6 +40,7 @@ class Einsum(nn.Module):
     init_fn: nn.initializers.Initializer = nn.initializers.zeros
     # If not None, apply LoRA to the weight.
     lora_config: LoRAConfig | None = None
+    dot_general_cls: Any = None
 
     def setup(self):
         self.w = self.param("w", self.init_fn, self.shape)
@@ -54,15 +56,27 @@ class Einsum(nn.Module):
     @nn.compact
     def __call__(self, eqn: str, x):
         dtype = x.dtype  # original dtype, could be half-precision
-        result = jnp.einsum(eqn, x, self.w.astype(dtype))
+        result = self._einsum(eqn, x, self.w.astype(dtype), name="base_dot")
 
         if config := self.lora_config:
             eqn_a, eqn_b = self._make_lora_eqns(eqn)
-            lora = jnp.einsum(eqn_a, x, self.w_a.astype(dtype))
-            lora = jnp.einsum(eqn_b, lora, self.w_b.astype(dtype))
+            lora = self._einsum(eqn_a, x, self.w_a.astype(dtype), name="lora_a_dot")
+            lora = self._einsum(eqn_b, lora, self.w_b.astype(dtype), name="lora_b_dot")
             result = result + lora * config.scaling_value
 
         return result
+
+    def _einsum(self, eqn: str, lhs, rhs, *, name: str):
+        if self.dot_general_cls is None:
+            return jnp.einsum(eqn, lhs, rhs)
+        dot_module = self.dot_general_cls(name=name)
+
+        # jnp.einsum hashes _dot_general as a static argument. Linen modules
+        # that hold variables are intentionally non-hashable.
+        def dot_general(*args, **kwargs):
+            return dot_module(*args, **kwargs)
+
+        return jnp.einsum(eqn, lhs, rhs, _dot_general=dot_general)
 
     def _make_lora_eqns(self, eqn: str) -> tuple[str, str]:
         if "L" in eqn:
@@ -92,6 +106,7 @@ class FeedForward(nn.Module):
     hidden_dim: int
     # If not None, apply LoRA to the weight.
     lora_config: LoRAConfig | None = None
+    dot_general_cls: Any = None
 
     def setup(self):
         self.w_gating = self.param(
@@ -127,6 +142,7 @@ class FeedForward(nn.Module):
             x,
             self.w_gating[0],
             None if self.w_gating_lora is None else (self.w_gating_lora[0][0], self.w_gating_lora[1][0]),
+            name="gate",
         )
         gate_value = nn.gelu(ff_gate)
 
@@ -134,15 +150,28 @@ class FeedForward(nn.Module):
             x,
             self.w_gating[1],
             None if self.w_gating_lora is None else (self.w_gating_lora[0][1], self.w_gating_lora[1][1]),
+            name="up",
         )
         activations = gate_value * ff1
 
-        outputs = self._dot(activations, self.w_linear, self.w_linear_lora)
+        outputs = self._dot(activations, self.w_linear, self.w_linear_lora, name="down")
         assert outputs.dtype == dtype
         return outputs
 
-    def _dot(self, x: at.Array, w: at.Array, lora_weights: tuple[at.Array, at.Array] | None) -> at.Array:
-        base = jnp.dot(x, w.astype(x.dtype))
+    def _dot(
+        self,
+        x: at.Array,
+        w: at.Array,
+        lora_weights: tuple[at.Array, at.Array] | None,
+        *,
+        name: str,
+    ) -> at.Array:
+        if self.dot_general_cls is None:
+            base = jnp.dot(x, w.astype(x.dtype))
+        else:
+            dot_general = self.dot_general_cls(name=f"{name}_dot")
+            dims = (((x.ndim - 1,), (0,)), ((), ()))
+            base = dot_general(x, w.astype(x.dtype), dims)
         if lora_weights is None:
             return base
         return base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
