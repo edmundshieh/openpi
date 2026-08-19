@@ -60,3 +60,19 @@ def test_nnx_bridge_uses_selected_recipe(monkeypatch, recipe, marker):
     jax.block_until_ready(output)
     assert output.shape == (32, 256)
     assert marker.lower() in str(jax.make_jaxpr(apply)(state, inputs)).lower()
+
+    multi_axis_inputs = jnp.ones((32, 3, 16), dtype=jnp.bfloat16)
+    multi_axis_kernel = jnp.ones((3, 16, 80), dtype=jnp.bfloat16)
+
+    @jax.jit
+    def apply_multi_axis(inputs, kernel):
+        return dot_general(
+            inputs,
+            kernel,
+            (((1, 2), (0, 1)), ((), ())),
+        )
+
+    multi_axis_output = apply_multi_axis(multi_axis_inputs, multi_axis_kernel)
+    jax.block_until_ready(multi_axis_output)
+    assert multi_axis_output.shape == (32, 80)
+    assert marker.lower() in str(jax.make_jaxpr(apply_multi_axis)(multi_axis_inputs, multi_axis_kernel)).lower()

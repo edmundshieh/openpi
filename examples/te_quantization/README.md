@@ -38,8 +38,13 @@ be treated as an optimized serving implementation.
 
 ## Standalone NNX example
 
-`nnx_custom_projection.py` demonstrates the same bridge with a generic custom
-projection and neutral dimensions:
+`nnx_custom_projection.py` demonstrates the same bridge with:
+
+- a native `nnx.Linear`,
+- a custom higher-rank projection with multiple output axes, and
+- a custom projection that contracts two axes.
+
+All dimensions and names are intentionally architecture-neutral.
 
 ```bash
 OPENPI_TE_RECIPE=mxfp8 \
