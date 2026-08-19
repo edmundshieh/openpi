@@ -27,7 +27,7 @@ We follow this einsum axis naming convention:
 
 from collections.abc import Sequence
 import dataclasses
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import einops
 import flax.linen as nn
@@ -111,6 +111,8 @@ def get_config(variant: Variant) -> Config:
 
 @at.typecheck
 class RMSNorm(nn.Module):
+    dot_general_cls: Any = None
+
     @nn.compact
     def __call__(self, x, cond):
         dtype = x.dtype  # original dtype, could be half-precision
@@ -125,7 +127,12 @@ class RMSNorm(nn.Module):
             return normed_inputs.astype(dtype), None  # return in original dtype
 
         # adaptive RMSNorm
-        modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
+        modulation = nn.Dense(
+            x.shape[-1] * 3,
+            kernel_init=nn.initializers.zeros,
+            dtype=dtype,
+            dot_general_cls=self.dot_general_cls,
+        )(cond)
         scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
         normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
@@ -159,6 +166,7 @@ class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+    dot_general_cls: Any = None
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
@@ -179,6 +187,7 @@ class Attention(nn.Module):
                     name=_name("qkv_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
+                    dot_general_cls=self.dot_general_cls,
                 )
                 qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x))
             else:
@@ -187,6 +196,7 @@ class Attention(nn.Module):
                     name=_name("q_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                     lora_config=config.lora_configs.get("attn"),
+                    dot_general_cls=self.dot_general_cls,
                 )
                 q = q_einsum("BTD,NDH->BTNH", x)
                 kv_einsum = lora.Einsum(
@@ -194,6 +204,7 @@ class Attention(nn.Module):
                     name=_name("kv_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
+                    dot_general_cls=self.dot_general_cls,
                 )
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
                 qkvs.append((q, k, v))
@@ -240,6 +251,7 @@ class Attention(nn.Module):
                     name=_name("attn_vec_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
                     lora_config=config.lora_configs.get("attn"),
+                    dot_general_cls=self.dot_general_cls,
                 )
                 out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end]))
                 start = end
@@ -288,19 +300,23 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    dot_general_cls: Any = None
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
-        attn = Attention(configs=self.configs, name="attn")
+        attn = Attention(configs=self.configs, dot_general_cls=self.dot_general_cls, name="attn")
 
         pre_attn = []
         gates = []
         for i, x in enumerate(xs):
             if x is not None:
-                x, gate = RMSNorm(name=_name("pre_attention_norm", i))(x, adarms_cond[i])  # noqa: PLW2901
+                x, gate = RMSNorm(  # noqa: PLW2901
+                    dot_general_cls=self.dot_general_cls,
+                    name=_name("pre_attention_norm", i),
+                )(x, adarms_cond[i])
             pre_attn.append(x)
             gates.append(gate if x is not None else None)
 
@@ -315,12 +331,16 @@ class Block(nn.Module):
         gates = []
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
-                x, gate = RMSNorm(name=_name("pre_ffw_norm", i))(x, adarms_cond[i])  # noqa: PLW2901
+                x, gate = RMSNorm(  # noqa: PLW2901
+                    dot_general_cls=self.dot_general_cls,
+                    name=_name("pre_ffw_norm", i),
+                )(x, adarms_cond[i])
                 x = lora.FeedForward(  # noqa: PLW2901
                     features=config.width,
                     hidden_dim=config.mlp_dim,
                     name=_name("mlp", i),
                     lora_config=config.lora_configs.get("ffn"),
+                    dot_general_cls=self.dot_general_cls,
                 )(x)
             out.append(x)
             gates.append(gate if x is not None else None)
@@ -346,6 +366,7 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    dot_general_cls: Any = None
 
     def setup(self):
         # all experts must have the same depth
@@ -378,8 +399,11 @@ class Module(nn.Module):
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            dot_general_cls=self.dot_general_cls,
         )
-        self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
+        self.final_norms = [
+            RMSNorm(dot_general_cls=self.dot_general_cls, name=_name("final_norm", i)) for i in range(len(self.configs))
+        ]
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:

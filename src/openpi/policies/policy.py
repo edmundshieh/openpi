@@ -61,7 +61,12 @@ class Policy(BasePolicy):
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            from openpi.models import te_quantization
+
+            if te_quantization.env_enabled():
+                self._sample_actions = te_quantization.module_jit_quantized(model.sample_actions)
+            else:
+                self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
     @override

@@ -15,6 +15,7 @@
 """A refactored and simplified ViT adoptation for Pi, taken from big_vision."""
 
 from collections.abc import Sequence
+from typing import Any
 
 import flax.linen as nn
 import jax
@@ -56,6 +57,7 @@ class MlpBlock(nn.Module):
     mlp_dim: int | None = None  # Defaults to 4x input dim
     dropout: float = 0.0
     dtype_mm: str = "float32"
+    dot_general_cls: Any = None
 
     @nn.compact
     def __call__(self, x, deterministic=True):  # noqa: FBT002
@@ -66,10 +68,15 @@ class MlpBlock(nn.Module):
         }
 
         _, _, d = x.shape  # n,l,d
-        x = nn.Dense(self.mlp_dim or 4 * d, dtype=self.dtype_mm, **inits)(x)
+        x = nn.Dense(
+            self.mlp_dim or 4 * d,
+            dtype=self.dtype_mm,
+            dot_general_cls=self.dot_general_cls,
+            **inits,
+        )(x)
         x = nn.gelu(x)
         x = nn.Dropout(rate=self.dropout)(x, deterministic)
-        return nn.Dense(d, dtype=self.dtype_mm, **inits)(x)
+        return nn.Dense(d, dtype=self.dtype_mm, dot_general_cls=self.dot_general_cls, **inits)(x)
 
 
 class Encoder1DBlock(nn.Module):
@@ -79,6 +86,7 @@ class Encoder1DBlock(nn.Module):
     num_heads: int = 12
     dropout: float = 0.0
     dtype_mm: str = "float32"
+    dot_general_cls: Any = None
 
     @nn.compact
     def __call__(self, x, deterministic=True):  # noqa: FBT002
@@ -90,6 +98,8 @@ class Encoder1DBlock(nn.Module):
             kernel_init=nn.initializers.xavier_uniform(),
             deterministic=deterministic,
             dtype=self.dtype_mm,
+            qkv_dot_general_cls=self.dot_general_cls,
+            out_dot_general_cls=self.dot_general_cls,
         )(y, y)
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
@@ -100,6 +110,7 @@ class Encoder1DBlock(nn.Module):
             mlp_dim=self.mlp_dim,
             dropout=self.dropout,
             dtype_mm=self.dtype_mm,
+            dot_general_cls=self.dot_general_cls,
         )(y, deterministic)
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
@@ -118,6 +129,7 @@ class Encoder(nn.Module):
     scan: bool = False
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    dot_general_cls: Any = None
 
     @nn.compact
     def __call__(self, x, deterministic=True):  # noqa: FBT002
@@ -142,6 +154,7 @@ class Encoder(nn.Module):
                 mlp_dim=self.mlp_dim,
                 num_heads=self.num_heads,
                 dropout=self.dropout,
+                dot_general_cls=self.dot_general_cls,
             )(x, deterministic)
             for lyr in range(self.depth):
                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
@@ -154,6 +167,7 @@ class Encoder(nn.Module):
                     mlp_dim=self.mlp_dim,
                     num_heads=self.num_heads,
                     dropout=self.dropout,
+                    dot_general_cls=self.dot_general_cls,
                 )
                 x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
             out["pre_ln"] = x  # Alias for last block, but without the number in it.
@@ -203,6 +217,7 @@ class _Module(nn.Module):
     # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    dot_general_cls: Any = None
 
     @nn.compact
     def __call__(self, image, *, train=False):
@@ -246,6 +261,7 @@ class _Module(nn.Module):
             scan=self.scan,
             remat_policy=self.remat_policy,
             dtype_mm=self.dtype_mm,
+            dot_general_cls=self.dot_general_cls,
             name="Transformer",
         )(x, deterministic=not train)
         encoded = out["encoded"] = x
@@ -272,7 +288,12 @@ class _Module(nn.Module):
 
         if self.rep_size:
             rep_size = self.width if self.rep_size is True else self.rep_size
-            hid = nn.Dense(rep_size, dtype=self.dtype_mm, name="pre_logits")
+            hid = nn.Dense(
+                rep_size,
+                dtype=self.dtype_mm,
+                dot_general_cls=self.dot_general_cls,
+                name="pre_logits",
+            )
             # NOTE: In the past we did not include tanh in pre_logits.
             # For few-shot, it should not matter much, as it whitens anyways.
             x_2d = nn.tanh(hid(x_2d))
@@ -283,7 +304,13 @@ class _Module(nn.Module):
 
         if self.num_classes:
             kw = {"kernel_init": nn.initializers.zeros} if self.head_zeroinit else {}
-            head = nn.Dense(self.num_classes, dtype=self.dtype_mm, name="head", **kw)
+            head = nn.Dense(
+                self.num_classes,
+                dtype=self.dtype_mm,
+                dot_general_cls=self.dot_general_cls,
+                name="head",
+                **kw,
+            )
             x_2d = out["logits_2d"] = head(x_2d)
             x = out["logits"] = head(x)
 
