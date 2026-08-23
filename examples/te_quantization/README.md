@@ -52,6 +52,48 @@ This is intended as a recipe-correctness and accuracy reference. TE JAX does
 not currently pre-pack constant weights for inference, so this path should not
 be treated as an optimized serving implementation.
 
+## Inference-optimized π0.7 serving on Thor
+
+Use the
+[`pi07-libero-optimized-serving`](https://github.com/edmundshieh/pi06-thor-inference/tree/pi07-libero-optimized-serving)
+branch for the prepacked FP8 Thor backend.
+
+```bash
+git clone https://github.com/edmundshieh/pi06-thor-inference.git
+cd pi06-thor-inference
+git switch pi07-libero-optimized-serving
+pixi install --locked
+pixi run build
+```
+
+Generate the calibration once by following the
+[backend README](https://github.com/edmundshieh/pi06-thor-inference/tree/pi07-libero-optimized-serving),
+then start the server:
+
+```bash
+OPENPI_ROOT=/path/to/a/pi07-capable/openpi-beta
+CHECKPOINT=~/.cache/openpi/openpi-assets-preview/checkpoints/pi07_libero
+PI06_AOT_BUILD_ROOT="$PWD/build" \
+  pixi run python scripts/serve_pi07_thor.py \
+  --openpi-root "$OPENPI_ROOT" \
+  --checkpoint "$CHECKPOINT" \
+  --calibration "$PWD/work/pi07_libero_calibration.json" \
+  --port 8000
+```
+
+Run the LIBERO client from the OpenPI-beta checkout:
+
+```bash
+cd "$OPENPI_ROOT"
+examples/libero/run_eval.sh \
+  --args.host 127.0.0.1 \
+  --args.port 8000 \
+  --args.task-suite-name libero_10
+```
+
+On a 20-SM Thor in MAXN with locked clocks, the fully warmed server measures
+`103.6 ms` mean, `103.5 ms` median, and `103.8 ms` p95.
+
 ## Entry point 2: architecture-neutral NNX example
 
 [`nnx_custom_projection.py`](nnx_custom_projection.py) is a focused reproducer
